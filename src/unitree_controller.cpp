@@ -1,7 +1,8 @@
 #include "unitree_controller.hpp"
-#include <stdexcept>
+#include <algorithm>
 #include <cstddef>
 #include <iostream>
+#include <stdexcept>
 
 using std::size_t;
 
@@ -35,6 +36,15 @@ UnitreeController::UnitreeController(const UnitreeConfig& cfg)
       num_dofs_(cfg.num_dofs),
       mode_pr_(Mode::PR),
       mode_machine_(0) {
+    if (num_dofs_ == 0 || stiffness_.size() != num_dofs_ || damping_.size() != num_dofs_) {
+        throw std::invalid_argument("num_dofs, stiffness, and damping must have matching non-zero sizes");
+    }
+    if (cfg_.command_timeout < 0.0 || !std::isfinite(cfg_.command_timeout)) {
+        throw std::invalid_argument("command_timeout must be finite and non-negative");
+    }
+    if (cfg_.shutdown_damping < 0.0 || !std::isfinite(cfg_.shutdown_damping)) {
+        throw std::invalid_argument("shutdown_damping must be finite and non-negative");
+    }
     if (cfg.hand_type == "Dex-3") {
         num_dofs_hand_ = 7;
     } else if (cfg.hand_type == "NONE") {
@@ -158,6 +168,7 @@ void UnitreeController::LowStateHandler(const void* message) {
     // std::cout << "imu rpy: " << imu_tmp.rpy[0] << ", " << imu_tmp.rpy[1] << ", " << imu_tmp.rpy[2] << std::endl;
 
     robot_state_buffer_.SetData(robot_state_tmp);
+    last_state_time_ns_.store(MonotonicNowNs());
 
     // update mode machine
     if (mode_machine_ != low_state.mode_machine()) {
@@ -177,11 +188,22 @@ void UnitreeController::SportStateHandler(const void* message) {
 }
 
 void UnitreeController::LowCommandWriter() {
+    std::lock_guard<std::mutex> lock(command_mutex_);
     LowCmd_ dds_low_command;
     dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
     dds_low_command.mode_machine() = mode_machine_;
 
-    const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetData();
+    std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetData();
+    if (command_mode_.load() == CommandMode::POSITION && cfg_.command_timeout > 0.0) {
+        const int64_t elapsed_ns = MonotonicNowNs() - last_command_time_ns_.load();
+        if (elapsed_ns > static_cast<int64_t>(cfg_.command_timeout * 1e9)) {
+            MotorCommand damping_command = MakeDampingCommand(cfg_.shutdown_damping);
+            motor_command_buffer_.SetData(damping_command);
+            command_mode_.store(CommandMode::DAMPING);
+            mc = motor_command_buffer_.GetData();
+            std::cerr << "Unitree position-command watchdog expired; damping enabled." << std::endl;
+        }
+    }
     if (mc) {
         // std::cout << "LowCommandWriter called with motor command data." << std::endl;
         for (size_t i = 0; i < num_dofs_; i++) {
@@ -237,6 +259,11 @@ void UnitreeController::step(const std::vector<double>& actions) {
     if (actions.size() != num_dofs_) {
         throw std::runtime_error("actions size mismatch");
     }
+    for (const double action : actions) {
+        if (!std::isfinite(action)) {
+            throw std::invalid_argument("actions must contain only finite values");
+        }
+    }
     // std::cout << "UnitreeController step called with actions: ";
 
     // control the motors
@@ -263,7 +290,12 @@ void UnitreeController::step(const std::vector<double>& actions) {
         // motor_command_tmp.dq_target.at(i) = 0.0;
         // motor_command_tmp.tau_ff.at(i) = 0.0;
     }
-    motor_command_buffer_.SetData(motor_command_tmp);
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        motor_command_buffer_.SetData(motor_command_tmp);
+        last_command_time_ns_.store(MonotonicNowNs());
+        command_mode_.store(CommandMode::POSITION);
+    }
     LowCommandWriter(); // immediately send command
 }
 
@@ -299,8 +331,16 @@ void UnitreeController::set_gains(const std::vector<double>& stiffness, const st
     if (stiffness.size() != num_dofs_ || damping.size() != num_dofs_) {
         throw std::runtime_error("stiffness or damping size mismatch");
     }
-    stiffness_ = stiffness;
-    damping_ = damping;
+    for (size_t i = 0; i < num_dofs_; ++i) {
+        if (!std::isfinite(stiffness[i]) || !std::isfinite(damping[i]) || stiffness[i] < 0.0 || damping[i] < 0.0) {
+            throw std::invalid_argument("stiffness and damping must be finite and non-negative");
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        stiffness_ = stiffness;
+        damping_ = damping;
+    }
 
     std::cout << "Gains set: stiffness = [";
     for (const auto& s : stiffness_) {
@@ -313,10 +353,72 @@ void UnitreeController::set_gains(const std::vector<double>& stiffness, const st
     std::cout << "]" << std::endl;
 }
 
+void UnitreeController::set_passive() {
+    MotorCommand passive_command(num_dofs_);
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        motor_command_buffer_.SetData(passive_command);
+        command_mode_.store(CommandMode::PASSIVE);
+    }
+    LowCommandWriter();
+}
+
+MotorCommand UnitreeController::MakeDampingCommand(double damping) const {
+    if (!std::isfinite(damping) || damping < 0.0) {
+        throw std::invalid_argument("damping must be finite and non-negative");
+    }
+    MotorCommand damping_command(num_dofs_);
+    std::fill(damping_command.kd.begin(), damping_command.kd.end(), static_cast<float>(damping));
+    return damping_command;
+}
+
+void UnitreeController::set_damping(double damping) {
+    MotorCommand damping_command = MakeDampingCommand(damping);
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        motor_command_buffer_.SetData(damping_command);
+        command_mode_.store(CommandMode::DAMPING);
+    }
+    LowCommandWriter();
+}
+
+void UnitreeController::arm_position_control() {
+    const RobotState robot_state = get_robot_state();
+    MotorCommand hold_command(num_dofs_);
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        for (size_t i = 0; i < num_dofs_; ++i) {
+            hold_command.q_target[i] = robot_state.motor_state.q[i];
+            hold_command.kp[i] = stiffness_[i];
+            hold_command.kd[i] = damping_[i];
+        }
+        motor_command_buffer_.SetData(hold_command);
+        last_command_time_ns_.store(MonotonicNowNs());
+        command_mode_.store(CommandMode::POSITION);
+    }
+    LowCommandWriter();
+}
+
+int64_t UnitreeController::MonotonicNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool UnitreeController::state_is_fresh(double timeout) const {
+    if (!std::isfinite(timeout) || timeout < 0.0) {
+        throw std::invalid_argument("state timeout must be finite and non-negative");
+    }
+    if (timeout == 0.0) {
+        return true;
+    }
+    const int64_t last_state_ns = last_state_time_ns_.load();
+    return last_state_ns > 0 && MonotonicNowNs() - last_state_ns <= static_cast<int64_t>(timeout * 1e9);
+}
+
 void UnitreeController::shutdown() {
     std::cout << "Shutting down UnitreeController..." << std::endl;
-    set_gains(std::vector<double>(num_dofs_, 0.0), std::vector<double>(num_dofs_, 5.0));
-    step(std::vector<double>(num_dofs_, 0.0));
+    set_damping(cfg_.shutdown_damping);
 }
 
 RobotState UnitreeController::get_robot_state() {

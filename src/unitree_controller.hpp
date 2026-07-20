@@ -1,5 +1,8 @@
 // src/robot_controller.hpp
 #pragma once
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <vector>
 #include <map>
 #include <string>
@@ -130,6 +133,12 @@ enum class ControlMode {
     TORQUE = 2
 };
 
+enum class CommandMode {
+    PASSIVE = 0,
+    DAMPING = 1,
+    POSITION = 2,
+};
+
 struct UnitreeConfig {
     std::string net_if;
     double control_dt;
@@ -147,6 +156,8 @@ struct UnitreeConfig {
     std::vector<double> stiffness;
     std::vector<double> damping;
     unsigned short num_dofs;
+    double command_timeout = 0.0;
+    double shutdown_damping = 5.0;
 };
 
 class UnitreeController {
@@ -157,6 +168,10 @@ class UnitreeController {
     void step(const std::vector<double>& actions);
     void step_hands(const std::vector<double>& l_hand_pose, const std::vector<double>& r_hand_pose);
     void set_gains(const std::vector<double>& stiffness, const std::vector<double>& damping);
+    void set_passive();
+    void set_damping(double damping);
+    void arm_position_control();
+    bool state_is_fresh(double timeout) const;
     void shutdown();
 
     RobotState get_robot_state();
@@ -173,6 +188,10 @@ class UnitreeController {
     Mode mode_pr_;
     uint8_t mode_machine_;
     bool init_done_ = false;
+    std::atomic<CommandMode> command_mode_{CommandMode::PASSIVE};
+    std::atomic<int64_t> last_command_time_ns_{0};
+    std::atomic<int64_t> last_state_time_ns_{0};
+    std::mutex command_mutex_;
 
     DataBuffer<MotorCommand> motor_command_buffer_;
 
@@ -203,4 +222,6 @@ class UnitreeController {
     void SportStateHandler(const void* message);
     void LowCommandWriter();
     void HandCommandWriter();
+    static int64_t MonotonicNowNs();
+    MotorCommand MakeDampingCommand(double damping) const;
 };

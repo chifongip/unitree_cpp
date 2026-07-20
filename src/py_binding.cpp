@@ -20,7 +20,9 @@ void bind_UnitreeConfig(py::module_& m) {
         .def_readwrite("sport_state_topic", &UnitreeConfig::sport_state_topic)
         .def_readwrite("stiffness", &UnitreeConfig::stiffness)
         .def_readwrite("damping", &UnitreeConfig::damping)
-        .def_readwrite("num_dofs", &UnitreeConfig::num_dofs);
+        .def_readwrite("num_dofs", &UnitreeConfig::num_dofs)
+        .def_readwrite("command_timeout", &UnitreeConfig::command_timeout)
+        .def_readwrite("shutdown_damping", &UnitreeConfig::shutdown_damping);
 }
 
 void bind_RobotState(py::module_& m) {
@@ -79,6 +81,10 @@ void bind_UnitreeController(py::module_& m) {
             cfg.stiffness = cfg_dict["stiffness"].cast<std::vector<double>>();
             cfg.damping = cfg_dict["damping"].cast<std::vector<double>>();
             cfg.num_dofs = cfg_dict["num_dofs"].cast<unsigned short>();
+            if (cfg_dict.contains("command_timeout"))
+                cfg.command_timeout = cfg_dict["command_timeout"].cast<double>();
+            if (cfg_dict.contains("shutdown_damping"))
+                cfg.shutdown_damping = cfg_dict["shutdown_damping"].cast<double>();
 
             std::string mode_str = cfg_dict["control_mode"].cast<std::string>();
             if (mode_str == "position")
@@ -97,6 +103,10 @@ void bind_UnitreeController(py::module_& m) {
         .def("step", &UnitreeController::step, py::arg("actions"))
         .def("step_hands", &UnitreeController::step_hands, py::arg("l_hand_pose"), py::arg("r_hand_pose"))
         .def("set_gains", &UnitreeController::set_gains, py::arg("stiffness"), py::arg("damping"))
+        .def("set_passive", &UnitreeController::set_passive)
+        .def("set_damping", &UnitreeController::set_damping, py::arg("damping"))
+        .def("arm_position_control", &UnitreeController::arm_position_control)
+        .def("state_is_fresh", &UnitreeController::state_is_fresh, py::arg("timeout"))
         .def("shutdown", &UnitreeController::shutdown)
         .def("get_robot_state", &UnitreeController::get_robot_state)
         .def("get_sport_state", &UnitreeController::get_sport_state);
