@@ -2,11 +2,28 @@
 #include <algorithm>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
 using std::size_t;
 
-inline uint32_t Crc32Core(uint32_t* ptr, uint32_t len) {
+namespace {
+bool FitsMotorFloat(double value) {
+    return std::isfinite(value) && std::abs(value) <= std::numeric_limits<float>::max();
+}
+
+void ValidateGains(const std::vector<double>& stiffness, const std::vector<double>& damping, size_t count) {
+    if (stiffness.size() != count || damping.size() != count)
+        throw std::invalid_argument("stiffness and damping must match num_dofs");
+    for (size_t i = 0; i < count; ++i) {
+        if (!FitsMotorFloat(stiffness[i]) || !FitsMotorFloat(damping[i]) || stiffness[i] < 0 || damping[i] < 0)
+            throw std::invalid_argument("stiffness and damping must be non-negative motor floats");
+    }
+}
+}  // namespace
+
+uint32_t UnitreeController::Crc32Core(uint32_t* ptr, uint32_t len) {
     uint32_t xbit = 0;
     uint32_t data = 0;
     uint32_t CRC32 = 0xFFFFFFFF;
@@ -30,20 +47,50 @@ inline uint32_t Crc32Core(uint32_t* ptr, uint32_t len) {
 };
 
 UnitreeController::UnitreeController(const UnitreeConfig& cfg)
+    : UnitreeController(cfg, {}) {}
+
+UnitreeController::UnitreeController(const UnitreeConfig& cfg, std::function<bool(const LowCmd_&)> sink)
     : cfg_(cfg),
+      command_sink_(std::move(sink)),
       stiffness_(cfg.stiffness),
       damping_(cfg.damping),
       num_dofs_(cfg.num_dofs),
       mode_pr_(Mode::PR),
       mode_machine_(0) {
-    if (num_dofs_ == 0 || stiffness_.size() != num_dofs_ || damping_.size() != num_dofs_) {
-        throw std::invalid_argument("num_dofs, stiffness, and damping must have matching non-zero sizes");
+    const auto motor_capacity = std::min(LowCmd_{}.motor_cmd().size(), LowState_{}.motor_state().size());
+    if (num_dofs_ == 0 || num_dofs_ > motor_capacity) {
+        throw std::invalid_argument("num_dofs must be within the Unitree packet motor capacity");
     }
+    ValidateGains(stiffness_, damping_, num_dofs_);
     if (cfg_.command_timeout < 0.0 || !std::isfinite(cfg_.command_timeout)) {
         throw std::invalid_argument("command_timeout must be finite and non-negative");
     }
-    if (cfg_.shutdown_damping < 0.0 || !std::isfinite(cfg_.shutdown_damping)) {
-        throw std::invalid_argument("shutdown_damping must be finite and non-negative");
+    if (cfg_.shutdown_damping < 0.0 || !FitsMotorFloat(cfg_.shutdown_damping)) {
+        throw std::invalid_argument("shutdown_damping must be a non-negative motor float");
+    }
+    if (ArmCommandsConfigured() || cfg_.arm_effort_enabled ||
+        !cfg_.arm_effort_limits.empty() || !cfg_.arm_total_torque_limits.empty()) {
+        const auto arm_count = cfg_.arm_motor_indices.size();
+        if (cfg_.msg_type != "hg" || cfg_.control_mode != ControlMode::POSITION ||
+            cfg_.command_timeout <= 0 || !std::isfinite(cfg_.state_timeout) || cfg_.state_timeout <= 0 ||
+            arm_count == 0 || cfg_.arm_total_torque_limits.size() != arm_count ||
+            cfg_.arm_effort_limits.size() != arm_count) {
+            throw std::invalid_argument("Unitree arm commands require a motor mapping, matching limits, and both watchdogs");
+        }
+        std::vector<bool> assigned(num_dofs_, false);
+        for (size_t i = 0; i < arm_count; ++i) {
+            const auto slot = cfg_.arm_motor_indices[i];
+            if (slot >= num_dofs_ || assigned[slot]) {
+                throw std::invalid_argument("Unitree arm motor indices must be unique and in range");
+            }
+            assigned[slot] = true;
+            const double total = cfg_.arm_total_torque_limits[i];
+            const double effort = cfg_.arm_effort_limits[i];
+            if (!std::isfinite(total) || !FitsMotorFloat(effort) || total < 0 || effort < 0 ||
+                effort > total || (cfg_.arm_effort_enabled && effort == 0)) {
+                throw std::invalid_argument("Invalid Unitree arm torque limits");
+            }
+        }
     }
     if (cfg.hand_type == "Dex-3") {
         num_dofs_hand_ = 7;
@@ -51,6 +98,9 @@ UnitreeController::UnitreeController(const UnitreeConfig& cfg)
         num_dofs_hand_ = 0;
     } else {
         throw std::runtime_error("Unsupported hand type: " + cfg.hand_type);
+    }
+    if (command_sink_) {
+        return;
     }
     std::cout << cfg.hand_type << " hand with " << num_dofs_hand_ << " DOFs." << std::endl;
 
@@ -131,49 +181,50 @@ bool UnitreeController::self_check() {
 }
 
 void UnitreeController::LowStateHandler(const void* message) {
+    const auto received_ns = MonotonicNowNs();
     LowState_ low_state = *(const LowState_*)message;
-    // std::cout << "LowState received: " << low_state.tick() << std::endl;
     if (low_state.crc() != Crc32Core((uint32_t*)&low_state, (sizeof(LowState_) >> 2) - 1)) {
         std::cout << "[ERROR] CRC Error" << std::endl;
         return;
     }
-    // low_state_buffer_.SetData(low_state);
-
     RobotState robot_state_tmp(num_dofs_);
-
     robot_state_tmp.tick = low_state.tick();
 
-    // get motor state
-    // MotorState ms_tmp(num_dofs_);
     MotorState& ms_tmp = robot_state_tmp.motor_state;
     for (int i = 0; i < num_dofs_; ++i) {
         ms_tmp.q.at(i) = low_state.motor_state()[i].q();
         ms_tmp.dq.at(i) = low_state.motor_state()[i].dq();
         ms_tmp.tau_est.at(i) = low_state.motor_state()[i].tau_est();
-        // if (low_state.motor_state()[i].motorstate() && i <= RightAnkleRoll)
-        //     std::cout << "[ERROR] motor " << i << " with code " << low_state.motor_state()[i].motorstate() << "\n";
     }
-    // motor_state_buffer_.SetData(ms_tmp);
 
-    // get imu state
-    // ImuState imu_tmp;
     ImuState& imu_tmp = robot_state_tmp.imu_state;
     imu_tmp.quaternion = low_state.imu_state().quaternion();
     imu_tmp.gyroscope = low_state.imu_state().gyroscope();
     imu_tmp.accelerometer = low_state.imu_state().accelerometer();
     imu_tmp.rpy = low_state.imu_state().rpy();
-    // imu_state_buffer_.SetData(imu_tmp);
 
     memcpy(&robot_state_tmp.wireless_remote, &low_state.wireless_remote()[0], 40);
-    // std::cout << "imu rpy: " << imu_tmp.rpy[0] << ", " << imu_tmp.rpy[1] << ", " << imu_tmp.rpy[2] << std::endl;
 
+    std::unique_lock<std::mutex> lock(command_mutex_, std::defer_lock);
+    if (ArmCommandsConfigured()) {
+        lock.lock();
+        const auto previous = robot_state_buffer_.GetData();
+        if (previous) {
+            const uint32_t tick_delta = robot_state_tmp.tick - previous->tick;
+            if (received_ns < last_state_time_ns_.load() || tick_delta == 0)
+                return;
+            if (tick_delta >= (uint32_t{1} << 31))
+                LatchDampingLocked();
+        }
+    }
+    robot_state_tmp.received_time_sec = received_ns * 1e-9;
     robot_state_buffer_.SetData(robot_state_tmp);
-    last_state_time_ns_.store(MonotonicNowNs());
+    last_state_time_ns_.store(received_ns);
 
     // update mode machine
     if (mode_machine_ != low_state.mode_machine()) {
         if (mode_machine_ == 0)
-            std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;
+            std::cout << "Unitree mode_machine: " << unsigned(low_state.mode_machine()) << std::endl;
         mode_machine_ = low_state.mode_machine();
     }
 }
@@ -189,23 +240,58 @@ void UnitreeController::SportStateHandler(const void* message) {
 
 void UnitreeController::LowCommandWriter() {
     std::lock_guard<std::mutex> lock(command_mutex_);
+    LowCommandWriterLocked();
+}
+
+void UnitreeController::LatchDampingLocked() {
+    if (watchdog_latched_ && command_mode_.load() == CommandMode::DAMPING)
+        return;
+    watchdog_latched_ = true;
+    ++reset_generation_;
+    motor_command_buffer_.SetData(MakeDampingCommand(cfg_.shutdown_damping));
+    command_mode_.store(CommandMode::DAMPING);
+}
+
+void UnitreeController::CheckArmCommandWatchdogsLocked(int64_t now) {
+    if (!ArmCommandsConfigured() || command_mode_.load() != CommandMode::POSITION)
+        return;
+    const auto received = last_state_time_ns_.load();
+    if (received <= 0 || now - received > cfg_.state_timeout * 1e9 ||
+        now - last_command_time_ns_.load() > cfg_.command_timeout * 1e9) {
+        LatchDampingLocked();
+    }
+}
+
+void UnitreeController::RequirePositionControlLocked(int64_t now) {
+    CheckArmCommandWatchdogsLocked(now);
+    if (shutdown_started_ || watchdog_latched_ || command_mode_.load() != CommandMode::POSITION) {
+        LowCommandWriterLocked();
+        throw std::runtime_error("Unitree arm position control requires explicit rearm");
+    }
+}
+
+void UnitreeController::LowCommandWriterLocked() {
+    if (ArmCommandsConfigured()) {
+        CheckArmCommandWatchdogsLocked(MonotonicNowNs());
+    } else if (command_mode_.load() == CommandMode::POSITION && cfg_.command_timeout > 0.0 &&
+               MonotonicNowNs() - last_command_time_ns_.load() > cfg_.command_timeout * 1e9) {
+        motor_command_buffer_.SetData(MakeDampingCommand(cfg_.shutdown_damping));
+        command_mode_.store(CommandMode::DAMPING);
+        std::cerr << "Unitree position-command watchdog expired; damping enabled." << std::endl;
+    }
+    if (!WriteCommandLocked() && ArmCommandsConfigured()) {
+        LatchDampingLocked();
+        WriteCommandLocked();
+    }
+}
+
+bool UnitreeController::WriteCommandLocked() {
     LowCmd_ dds_low_command;
     dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
     dds_low_command.mode_machine() = mode_machine_;
 
-    std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetData();
-    if (command_mode_.load() == CommandMode::POSITION && cfg_.command_timeout > 0.0) {
-        const int64_t elapsed_ns = MonotonicNowNs() - last_command_time_ns_.load();
-        if (elapsed_ns > static_cast<int64_t>(cfg_.command_timeout * 1e9)) {
-            MotorCommand damping_command = MakeDampingCommand(cfg_.shutdown_damping);
-            motor_command_buffer_.SetData(damping_command);
-            command_mode_.store(CommandMode::DAMPING);
-            mc = motor_command_buffer_.GetData();
-            std::cerr << "Unitree position-command watchdog expired; damping enabled." << std::endl;
-        }
-    }
+    const auto mc = motor_command_buffer_.GetData();
     if (mc) {
-        // std::cout << "LowCommandWriter called with motor command data." << std::endl;
         for (size_t i = 0; i < num_dofs_; i++) {
             dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable
             dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
@@ -216,8 +302,15 @@ void UnitreeController::LowCommandWriter() {
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-        lowcmd_publisher_->Write(dds_low_command);
+        try {
+            return command_sink_ ? command_sink_(dds_low_command) : lowcmd_publisher_->Write(dds_low_command);
+        } catch (const std::exception&) {
+            if (!ArmCommandsConfigured())
+                throw;
+            return false;
+        }
     }
+    return true;
 }
 
 void UnitreeController::HandCommandWriter() {
@@ -256,17 +349,17 @@ void UnitreeController::HandCommandWriter() {
 }
 
 void UnitreeController::step(const std::vector<double>& actions) {
-    if (actions.size() != num_dofs_) {
-        throw std::runtime_error("actions size mismatch");
-    }
-    for (const double action : actions) {
-        if (!std::isfinite(action)) {
-            throw std::invalid_argument("actions must contain only finite values");
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    if (ArmCommandsConfigured())
+        RequirePositionControlLocked(MonotonicNowNs());
+    if (actions.size() != num_dofs_ || !std::all_of(actions.begin(), actions.end(), FitsMotorFloat)) {
+        if (ArmCommandsConfigured()) {
+            LatchDampingLocked();
+            WriteCommandLocked();
         }
+        throw std::invalid_argument("actions must match num_dofs and contain only motor floats");
     }
-    // std::cout << "UnitreeController step called with actions: ";
 
-    // control the motors
     MotorCommand motor_command_tmp(num_dofs_);
 
     for (int i = 0; i < num_dofs_; ++i) {
@@ -286,17 +379,98 @@ void UnitreeController::step(const std::vector<double>& actions) {
                 throw std::runtime_error("Unknown control mode");
         }
 
-        // motor_command_tmp.q_target.at(i) = 0.0;
-        // motor_command_tmp.dq_target.at(i) = 0.0;
-        // motor_command_tmp.tau_ff.at(i) = 0.0;
     }
-    {
-        std::lock_guard<std::mutex> lock(command_mutex_);
-        motor_command_buffer_.SetData(motor_command_tmp);
-        last_command_time_ns_.store(MonotonicNowNs());
-        command_mode_.store(CommandMode::POSITION);
+    motor_command_buffer_.SetData(motor_command_tmp);
+    last_command_time_ns_.store(MonotonicNowNs());
+    command_mode_.store(CommandMode::POSITION);
+    LowCommandWriterLocked();
+    if (ArmCommandsConfigured() && watchdog_latched_)
+        throw std::runtime_error("Unitree position command failed; damping is latched");
+}
+
+UnitreeCommandReceipt UnitreeController::step(
+    const std::vector<double>& positions, const std::vector<double>& arm_efforts, uint64_t expected_reset_generation) {
+    if (!ArmCommandsConfigured())
+        throw std::runtime_error("Unitree arm commands are not configured");
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    RequirePositionControlLocked(MonotonicNowNs());
+    UnitreeCommandReceipt receipt{};
+    try {
+        const auto arm_count = cfg_.arm_motor_indices.size();
+        if (positions.size() != num_dofs_ || arm_efforts.size() != arm_count)
+            throw std::invalid_argument("Unitree position or arm effort command size mismatch");
+        const auto state = robot_state_buffer_.GetData();
+        MotorCommand command(num_dofs_);
+        for (size_t i = 0; i < num_dofs_; ++i) {
+            if (!FitsMotorFloat(positions[i]))
+                throw std::invalid_argument("Invalid Unitree position target");
+            command.q_target[i] = static_cast<float>(positions[i]);
+            command.kp[i] = static_cast<float>(stiffness_[i]);
+            command.kd[i] = static_cast<float>(damping_[i]);
+        }
+        const bool accept_effort = cfg_.arm_effort_enabled && expected_reset_generation == reset_generation_;
+        receipt.arm_efforts.assign(arm_count, 0.0f);
+        for (size_t arm = 0; arm < arm_count; ++arm) {
+            const double requested = arm_efforts[arm];
+            if (!std::isfinite(requested))
+                throw std::invalid_argument("Invalid Unitree arm effort");
+            if (requested == 0 || !accept_effort)
+                continue;
+            const auto i = cfg_.arm_motor_indices[arm];
+            const double q = state->motor_state.q[i];
+            const double dq = state->motor_state.dq[i];
+            const double pd = command.kp[i] * (command.q_target[i] - q) - command.kd[i] * dq;
+            if (!std::isfinite(pd))
+                throw std::invalid_argument("Invalid Unitree arm feedback or gains");
+            const double total = cfg_.arm_total_torque_limits[arm];
+            const double room = std::max(0.0, total - std::copysign(1.0, requested) * pd);
+            const double admitted = std::copysign(
+                std::min({std::abs(requested), cfg_.arm_effort_limits[arm], room}), requested);
+            float effort = static_cast<float>(admitted);
+            // The stored effort must not exceed the admitted magnitude.
+            if (std::abs(effort) > std::abs(admitted))
+                effort = std::nextafter(effort, 0.0f);
+            command.tau_ff[i] = effort;
+            receipt.arm_efforts[arm] = effort;
+        }
+        motor_command_buffer_.SetData(command);
+        const auto accepted = MonotonicNowNs();
+        last_command_time_ns_.store(accepted);
+        receipt.command_time_sec = accepted * 1e-9;
+        receipt.reset_generation = reset_generation_;
+    } catch (const std::exception&) {
+        LatchDampingLocked();
+        WriteCommandLocked();
+        throw;
     }
-    LowCommandWriter(); // immediately send command
+    LowCommandWriterLocked();
+    if (watchdog_latched_)
+        throw std::runtime_error("Unitree arm command failed; damping is latched");
+    return receipt;
+}
+
+UnitreeSafetyStatus UnitreeController::get_safety_status() {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    CheckArmCommandWatchdogsLocked(MonotonicNowNs());
+    return {reset_generation_, watchdog_latched_};
+}
+
+void UnitreeController::clear_arm_effort() {
+    if (!ArmCommandsConfigured())
+        return;
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    ClearArmEffortLocked();
+}
+
+void UnitreeController::ClearArmEffortLocked() {
+    ++reset_generation_;
+    const auto current = motor_command_buffer_.GetData();
+    if (current && std::any_of(current->tau_ff.begin(), current->tau_ff.end(), [](float x) { return x != 0; })) {
+        auto command = *current;
+        std::fill(command.tau_ff.begin(), command.tau_ff.end(), 0.0f);
+        motor_command_buffer_.SetData(command);
+        LowCommandWriterLocked();
+    }
 }
 
 void UnitreeController::step_hands(const std::vector<double>& l_hand_pose, const std::vector<double>& r_hand_pose) {
@@ -328,44 +502,40 @@ void UnitreeController::step_hands(const std::vector<double>& l_hand_pose, const
 }
 
 void UnitreeController::set_gains(const std::vector<double>& stiffness, const std::vector<double>& damping) {
-    if (stiffness.size() != num_dofs_ || damping.size() != num_dofs_) {
-        throw std::runtime_error("stiffness or damping size mismatch");
-    }
-    for (size_t i = 0; i < num_dofs_; ++i) {
-        if (!std::isfinite(stiffness[i]) || !std::isfinite(damping[i]) || stiffness[i] < 0.0 || damping[i] < 0.0) {
-            throw std::invalid_argument("stiffness and damping must be finite and non-negative");
-        }
-    }
+    ValidateGains(stiffness, damping, num_dofs_);
     {
         std::lock_guard<std::mutex> lock(command_mutex_);
         stiffness_ = stiffness;
         damping_ = damping;
+        if (ArmCommandsConfigured())
+            ClearArmEffortLocked();
     }
 
     std::cout << "Gains set: stiffness = [";
-    for (const auto& s : stiffness_) {
+    for (const auto& s : stiffness) {
         std::cout << s << " ";
     }
     std::cout << "], damping = [";
-    for (const auto& d : damping_) {
+    for (const auto& d : damping) {
         std::cout << d << " ";
     }
     std::cout << "]" << std::endl;
 }
 
 void UnitreeController::set_passive() {
-    MotorCommand passive_command(num_dofs_);
-    {
-        std::lock_guard<std::mutex> lock(command_mutex_);
-        motor_command_buffer_.SetData(passive_command);
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    CheckArmCommandWatchdogsLocked(MonotonicNowNs());
+    if (!watchdog_latched_) {
+        motor_command_buffer_.SetData(MotorCommand(num_dofs_));
         command_mode_.store(CommandMode::PASSIVE);
+        ++reset_generation_;
     }
-    LowCommandWriter();
+    LowCommandWriterLocked();
 }
 
 MotorCommand UnitreeController::MakeDampingCommand(double damping) const {
-    if (!std::isfinite(damping) || damping < 0.0) {
-        throw std::invalid_argument("damping must be finite and non-negative");
+    if (!FitsMotorFloat(damping) || damping < 0.0) {
+        throw std::invalid_argument("damping must be a non-negative motor float");
     }
     MotorCommand damping_command(num_dofs_);
     std::fill(damping_command.kd.begin(), damping_command.kd.end(), static_cast<float>(damping));
@@ -373,30 +543,48 @@ MotorCommand UnitreeController::MakeDampingCommand(double damping) const {
 }
 
 void UnitreeController::set_damping(double damping) {
-    MotorCommand damping_command = MakeDampingCommand(damping);
-    {
-        std::lock_guard<std::mutex> lock(command_mutex_);
+    const auto damping_command = MakeDampingCommand(damping);
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    CheckArmCommandWatchdogsLocked(MonotonicNowNs());
+    if (!watchdog_latched_) {
         motor_command_buffer_.SetData(damping_command);
         command_mode_.store(CommandMode::DAMPING);
+        ++reset_generation_;
     }
-    LowCommandWriter();
+    LowCommandWriterLocked();
 }
 
 void UnitreeController::arm_position_control() {
-    const RobotState robot_state = get_robot_state();
     MotorCommand hold_command(num_dofs_);
     {
         std::lock_guard<std::mutex> lock(command_mutex_);
+        if (ArmCommandsConfigured() && (shutdown_started_ || !state_is_fresh(cfg_.state_timeout))) {
+            LatchDampingLocked();
+            WriteCommandLocked();
+            throw std::runtime_error("Unitree arm rearm requires fresh feedback and a running controller");
+        }
+        const RobotState robot_state = get_robot_state();
         for (size_t i = 0; i < num_dofs_; ++i) {
-            hold_command.q_target[i] = robot_state.motor_state.q[i];
+            const bool controlled = stiffness_[i] > 0 || damping_[i] > 0;
+            if (ArmCommandsConfigured() && controlled && !std::isfinite(robot_state.motor_state.q[i])) {
+                LatchDampingLocked();
+                WriteCommandLocked();
+                throw std::runtime_error("Unitree arm rearm received nonfinite joint positions");
+            }
+            hold_command.q_target[i] =
+                !ArmCommandsConfigured() || controlled ? robot_state.motor_state.q[i] : 0.0f;
             hold_command.kp[i] = stiffness_[i];
             hold_command.kd[i] = damping_[i];
         }
         motor_command_buffer_.SetData(hold_command);
         last_command_time_ns_.store(MonotonicNowNs());
         command_mode_.store(CommandMode::POSITION);
+        watchdog_latched_ = false;
+        ++reset_generation_;
+        LowCommandWriterLocked();
+        if (ArmCommandsConfigured() && watchdog_latched_)
+            throw std::runtime_error("Unitree rearm failed; damping is latched");
     }
-    LowCommandWriter();
 }
 
 int64_t UnitreeController::MonotonicNowNs() {
@@ -418,6 +606,13 @@ bool UnitreeController::state_is_fresh(double timeout) const {
 
 void UnitreeController::shutdown() {
     std::cout << "Shutting down UnitreeController..." << std::endl;
+    if (ArmCommandsConfigured()) {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        shutdown_started_ = true;
+        LatchDampingLocked();
+        WriteCommandLocked();
+        return;
+    }
     set_damping(cfg_.shutdown_damping);
 }
 
@@ -425,7 +620,9 @@ RobotState UnitreeController::get_robot_state() {
     const std::shared_ptr<const RobotState> robot_state = robot_state_buffer_.GetData();
 
     if (robot_state) {
-        return *robot_state;
+        auto snapshot = *robot_state;
+        snapshot.age_sec = std::max(0.0, MonotonicNowNs() * 1e-9 - snapshot.received_time_sec);
+        return snapshot;
     } else {
         throw std::runtime_error("Low state data is not available");
     }
@@ -441,6 +638,7 @@ SportState UnitreeController::get_sport_state() {
     }
 }
 
+#ifdef UNITREE_CPP_STANDALONE
 int main(int argc, char const* argv[]) {
     // Example usage of UnitreeController
     UnitreeConfig config;
@@ -463,3 +661,4 @@ int main(int argc, char const* argv[]) {
         sleep(10);
     return 0;
 }
+#endif

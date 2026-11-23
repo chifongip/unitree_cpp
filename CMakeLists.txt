@@ -93,9 +93,20 @@ target_link_libraries(debugcpp PRIVATE
 target_compile_options(debugcpp PRIVATE
   -g -O0
 )
+target_compile_definitions(debugcpp PRIVATE UNITREE_CPP_STANDALONE)
 
 set_target_properties(debugcpp PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build/
   BUILD_WITH_INSTALL_RPATH TRUE
   INSTALL_RPATH "$ORIGIN:/usr/local/lib"
 )
+
+option(UNITREE_CPP_BUILD_TESTS "Build tests that use an in-process Unitree command sink" OFF)
+if(UNITREE_CPP_BUILD_TESTS)
+  enable_testing()
+  add_executable(unitree_observer_test tests/unitree_observer_test.cpp src/unitree_controller.cpp)
+  target_include_directories(unitree_observer_test PRIVATE src ${UNITREE_SDK2_INCLUDE} ${DDSCXX_ROOT_INCLUDE})
+  target_link_libraries(unitree_observer_test PRIVATE
+    ${UNITREE_SDK2_LIB} ${DDSC_LIB} ${DDSCXX_LIB} dl Threads::Threads)
+  add_test(NAME unitree_observer_test COMMAND unitree_observer_test)
+endif()

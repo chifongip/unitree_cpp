@@ -14,6 +14,7 @@
 #include <vector>
 #include <array>
 #include <cstddef>
+#include <functional>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -109,6 +110,8 @@ struct ImuState {
 
 struct RobotState {
     uint32_t tick;
+    double received_time_sec = 0.0;
+    double age_sec = 0.0;
     MotorState motor_state;
     ImuState imu_state;
     uint8_t wireless_remote[40];
@@ -158,6 +161,22 @@ struct UnitreeConfig {
     unsigned short num_dofs;
     double command_timeout = 0.0;
     double shutdown_damping = 5.0;
+    bool arm_effort_enabled = false;
+    double state_timeout = 0.0;
+    std::vector<size_t> arm_motor_indices;
+    std::vector<double> arm_total_torque_limits;
+    std::vector<double> arm_effort_limits;
+};
+
+struct UnitreeCommandReceipt {
+    double command_time_sec;
+    uint64_t reset_generation;
+    std::vector<float> arm_efforts;
+};
+
+struct UnitreeSafetyStatus {
+    uint64_t reset_generation;
+    bool latched;
 };
 
 class UnitreeController {
@@ -166,6 +185,10 @@ class UnitreeController {
     ~UnitreeController();
     bool self_check();
     void step(const std::vector<double>& actions);
+    UnitreeCommandReceipt step(const std::vector<double>& positions, const std::vector<double>& arm_efforts,
+                               uint64_t expected_reset_generation);
+    UnitreeSafetyStatus get_safety_status();
+    void clear_arm_effort();
     void step_hands(const std::vector<double>& l_hand_pose, const std::vector<double>& r_hand_pose);
     void set_gains(const std::vector<double>& stiffness, const std::vector<double>& damping);
     void set_passive();
@@ -178,7 +201,10 @@ class UnitreeController {
     SportState get_sport_state();
 
    private:
+    friend struct UnitreeObserverTest;
+    UnitreeController(const UnitreeConfig& cfg, std::function<bool(const LowCmd_&)> sink);
     UnitreeConfig cfg_;
+    std::function<bool(const LowCmd_&)> command_sink_;
 
     std::vector<double> stiffness_;
     std::vector<double> damping_;
@@ -186,12 +212,15 @@ class UnitreeController {
     unsigned short num_dofs_hand_;
 
     Mode mode_pr_;
-    uint8_t mode_machine_;
+    std::atomic<uint8_t> mode_machine_;
     bool init_done_ = false;
     std::atomic<CommandMode> command_mode_{CommandMode::PASSIVE};
     std::atomic<int64_t> last_command_time_ns_{0};
     std::atomic<int64_t> last_state_time_ns_{0};
     std::mutex command_mutex_;
+    uint64_t reset_generation_ = 0;
+    bool watchdog_latched_ = false;
+    bool shutdown_started_ = false;
 
     DataBuffer<MotorCommand> motor_command_buffer_;
 
@@ -221,7 +250,15 @@ class UnitreeController {
     void LowStateHandler(const void* message);
     void SportStateHandler(const void* message);
     void LowCommandWriter();
+    void LowCommandWriterLocked();
+    bool WriteCommandLocked();
+    void CheckArmCommandWatchdogsLocked(int64_t now);
+    void LatchDampingLocked();
+    void ClearArmEffortLocked();
+    void RequirePositionControlLocked(int64_t now);
+    bool ArmCommandsConfigured() const { return !cfg_.arm_motor_indices.empty(); }
     void HandCommandWriter();
     static int64_t MonotonicNowNs();
+    static uint32_t Crc32Core(uint32_t* ptr, uint32_t len);
     MotorCommand MakeDampingCommand(double damping) const;
 };
