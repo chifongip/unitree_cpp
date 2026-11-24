@@ -78,6 +78,21 @@ struct UnitreeObserverTest {
         Check(packets.back().motor_cmd()[kArm].tau() == 0, "SHADOW transmitted torque");
         Check(Feed(shadow, 1) == stamp, "Repeated tick refreshed the snapshot");
 
+        auto torso_cfg = Config(true, false);
+        Check(!torso_cfg.enable_torso_imu, "Torso IMU must be opt-in");
+        torso_cfg.enable_torso_imu = true;
+        UnitreeController torso(torso_cfg, sink);
+        const auto first_stamp = Feed(torso, 1);
+        unitree_hg::msg::dds_::IMUState_ torso_packet{};
+        torso_packet.gyroscope()[1] = 0.25f;
+        torso.TorsoImuStateHandler(&torso_packet);
+        Check(Feed(torso, 1) == first_stamp, "Torso IMU refreshed a repeated LowState tick");
+        const auto next_stamp = Feed(torso, 2);
+        const auto torso_state = torso.get_robot_state();
+        Check(next_stamp >= first_stamp && torso_state.tick == 2 &&
+                  torso_state.torso_imu_state.gyroscope[1] == 0.25f && torso_state.imu_state.gyroscope[1] == 0,
+              "Torso IMU did not stay separate from timestamped base feedback");
+
         UnitreeController ticking(Config(true, false), sink);
         const auto final_tick = std::numeric_limits<uint32_t>::max();
         Feed(ticking, final_tick);

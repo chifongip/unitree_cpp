@@ -113,7 +113,8 @@ struct RobotState {
     double received_time_sec = 0.0;
     double age_sec = 0.0;
     MotorState motor_state;
-    ImuState imu_state;
+    ImuState imu_state;        // pelvis / base IMU from LowState
+    ImuState torso_imu_state;  // optional torso IMU from rt/secondary_imu (G1)
     uint8_t wireless_remote[40];
 
     RobotState(size_t num_motors) : tick(0),
@@ -155,6 +156,9 @@ struct UnitreeConfig {
 
     bool enable_odometry;
     std::string sport_state_topic;
+
+    bool enable_torso_imu = false;
+    std::string torso_imu_topic = "rt/secondary_imu";
 
     std::vector<double> stiffness;
     std::vector<double> damping;
@@ -231,10 +235,12 @@ class UnitreeController {
     // DataBuffer<LowState_> low_state_buffer_;
     DataBuffer<RobotState> robot_state_buffer_;
     DataBuffer<SportState> sport_state_buffer_;
+    // Kept alive until both LowState and torso IMU subscribers are destroyed.
+    DataBuffer<ImuState> torso_imu_state_buffer_;
 
     ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
     ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
-    // ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
+    ChannelSubscriberPtr<unitree_hg::msg::dds_::IMUState_> torso_imu_subscriber_;
     ThreadPtr command_writer_ptr_;
 
     ChannelSubscriberPtr<unitree_go::msg::dds_::SportModeState_> estimate_state_subscriber;
@@ -249,6 +255,7 @@ class UnitreeController {
 
     void LowStateHandler(const void* message);
     void SportStateHandler(const void* message);
+    void TorsoImuStateHandler(const void* message);
     void LowCommandWriter();
     void LowCommandWriterLocked();
     bool WriteCommandLocked();

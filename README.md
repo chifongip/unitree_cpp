@@ -78,8 +78,43 @@ This project supports:
 
 **1.0.3 [IMPORTANT FIX]**
 - Fix control delay, send command immediately after step.
-    - this bug could lead to jittering and stability issue, see https://github.com/GDDG08/RoboJuDo/issues/2
+    - this bug could lead to jittering and stability issue, see [#2](https://github.com/HansZ8/unitree_cpp/issues/2).
 
+**1.0.4**
+- Add torso (secondary) IMU data for G1, exposed via `RobotState.torso_imu_state`. see [#5](https://github.com/HansZ8/unitree_cpp/issues/5).
+- Set `enable_torso_imu` to `true` to subscribe. The default topic is `rt/secondary_imu`.
+
+
+## TESTING guide
+
+> **Debug / development only.** The dummy SDK has no hardware or DDS and serves
+> simulated data — never deploy a dummy build to a real robot.
+
+The real Unitree SDK2 + CycloneDDS cannot be installed on every machine (e.g.
+macOS dev laptops). For development and interface testing, a header-only **dummy
+SDK** is bundled under [`dummy_sdk/`](dummy_sdk/). It provides stand-ins for the
+SDK symbols so the extension builds and `import unitree_cpp` works without any
+hardware or DDS.
+
+To make the pipeline runnable, the dummy **simulates inbound data**: subscribers
+synthesize a stationary robot (zeroed joints, identity base IMU, a slightly
+tilted torso IMU when enabled, zero odometry) and deliver it to the controller's
+callbacks during initialization. `self_check()` can then pass and
+`get_robot_state()` returns a populated state. The initial snapshot ages normally
+under the observer watchdog. Dummy publishers discard commands.
+
+The dummy is **opt-in**. A normal build links the real `unitree_sdk2` and fails
+loudly if it is not found, so a missing SDK is never silently replaced by a
+non-functional module. Enable the dummy explicitly:
+
+```bash
+pip install . --config-settings=cmake.define.USE_DUMMY_SDK=ON
+# or, with uv:
+uv pip install . --config-settings=cmake.define.USE_DUMMY_SDK=ON
+```
+
+A dummy build also emits a `RuntimeWarning` on `import unitree_cpp`, so it is
+never mistaken for a real one.
 
 ## License
 
