@@ -1,6 +1,7 @@
 from typing import List
 
 from .unitree_cpp import UnitreeController
+from .unitree_cpp import UnitreeConfig
 from .unitree_cpp import ImuState as _ImuState
 from .unitree_cpp import MotorState as _MotorState
 from .unitree_cpp import RobotState as _RobotState

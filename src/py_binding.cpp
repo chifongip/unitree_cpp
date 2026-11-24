@@ -22,7 +22,12 @@ void bind_UnitreeConfig(py::module_& m) {
         .def_readwrite("damping", &UnitreeConfig::damping)
         .def_readwrite("num_dofs", &UnitreeConfig::num_dofs)
         .def_readwrite("command_timeout", &UnitreeConfig::command_timeout)
-        .def_readwrite("shutdown_damping", &UnitreeConfig::shutdown_damping);
+        .def_readwrite("shutdown_damping", &UnitreeConfig::shutdown_damping)
+        .def_readwrite("arm_effort_enabled", &UnitreeConfig::arm_effort_enabled)
+        .def_readwrite("state_timeout", &UnitreeConfig::state_timeout)
+        .def_readwrite("arm_motor_indices", &UnitreeConfig::arm_motor_indices)
+        .def_readwrite("arm_total_torque_limits", &UnitreeConfig::arm_total_torque_limits)
+        .def_readwrite("arm_effort_limits", &UnitreeConfig::arm_effort_limits);
 }
 
 void bind_RobotState(py::module_& m) {
@@ -42,6 +47,8 @@ void bind_RobotState(py::module_& m) {
     py::class_<RobotState>(m, "RobotState")
         .def(py::init<size_t>())
         .def_readwrite("tick", &RobotState::tick)
+        .def_readonly("received_time_sec", &RobotState::received_time_sec)
+        .def_readonly("age_sec", &RobotState::age_sec)
         .def_readwrite("motor_state", &RobotState::motor_state)
         .def_readwrite("imu_state", &RobotState::imu_state)
         // .def_readwrite("wireless_remote", &RobotState::wireless_remote);
@@ -66,6 +73,13 @@ void bind_RobotState(py::module_& m) {
 
 // UnitreeController Class
 void bind_UnitreeController(py::module_& m) {
+    py::class_<UnitreeCommandReceipt>(m, "UnitreeCommandReceipt")
+        .def_readonly("command_time_sec", &UnitreeCommandReceipt::command_time_sec)
+        .def_readonly("reset_generation", &UnitreeCommandReceipt::reset_generation)
+        .def_readonly("arm_efforts", &UnitreeCommandReceipt::arm_efforts);
+    py::class_<UnitreeSafetyStatus>(m, "UnitreeSafetyStatus")
+        .def_readonly("reset_generation", &UnitreeSafetyStatus::reset_generation)
+        .def_readonly("latched", &UnitreeSafetyStatus::latched);
     py::class_<UnitreeController>(m, "UnitreeController")
         .def(py::init([](py::dict cfg_dict) {
             UnitreeConfig cfg;
@@ -85,6 +99,16 @@ void bind_UnitreeController(py::module_& m) {
                 cfg.command_timeout = cfg_dict["command_timeout"].cast<double>();
             if (cfg_dict.contains("shutdown_damping"))
                 cfg.shutdown_damping = cfg_dict["shutdown_damping"].cast<double>();
+            if (cfg_dict.contains("arm_effort_enabled"))
+                cfg.arm_effort_enabled = cfg_dict["arm_effort_enabled"].cast<bool>();
+            if (cfg_dict.contains("state_timeout"))
+                cfg.state_timeout = cfg_dict["state_timeout"].cast<double>();
+            if (cfg_dict.contains("arm_motor_indices"))
+                cfg.arm_motor_indices = cfg_dict["arm_motor_indices"].cast<std::vector<size_t>>();
+            if (cfg_dict.contains("arm_total_torque_limits"))
+                cfg.arm_total_torque_limits = cfg_dict["arm_total_torque_limits"].cast<std::vector<double>>();
+            if (cfg_dict.contains("arm_effort_limits"))
+                cfg.arm_effort_limits = cfg_dict["arm_effort_limits"].cast<std::vector<double>>();
 
             std::string mode_str = cfg_dict["control_mode"].cast<std::string>();
             if (mode_str == "position")
@@ -100,7 +124,12 @@ void bind_UnitreeController(py::module_& m) {
         }))
         .def(py::init<const UnitreeConfig&>(), py::arg("config"))
         .def("self_check", &UnitreeController::self_check)
-        .def("step", &UnitreeController::step, py::arg("actions"))
+        .def("step", py::overload_cast<const std::vector<double>&>(&UnitreeController::step), py::arg("actions"))
+        .def("step", py::overload_cast<const std::vector<double>&, const std::vector<double>&, uint64_t>(
+                 &UnitreeController::step),
+             py::arg("positions"), py::arg("arm_efforts"), py::arg("expected_reset_generation"))
+        .def("get_safety_status", &UnitreeController::get_safety_status)
+        .def("clear_arm_effort", &UnitreeController::clear_arm_effort)
         .def("step_hands", &UnitreeController::step_hands, py::arg("l_hand_pose"), py::arg("r_hand_pose"))
         .def("set_gains", &UnitreeController::set_gains, py::arg("stiffness"), py::arg("damping"))
         .def("set_passive", &UnitreeController::set_passive)
